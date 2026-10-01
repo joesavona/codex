@@ -1,3 +1,5 @@
+use codex_app_server_protocol::SkillMetadata;
+use codex_app_server_protocol::SkillScope;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::WidgetRef;
@@ -30,6 +32,11 @@ const COMMAND_COLUMN_WIDTH: ColumnWidthConfig = ColumnWidthConfig::new(
 pub(crate) enum CommandItem {
     Builtin(SlashCommand),
     ServiceTier(ServiceTierCommand),
+    Skill {
+        name: String,
+        description: String,
+        path: String,
+    },
 }
 
 pub(crate) struct CommandPopup {
@@ -95,6 +102,28 @@ impl CommandPopup {
         }
     }
 
+    pub(crate) fn with_skills(mut self, skills: &[SkillMetadata]) -> Self {
+        self.set_skills(skills);
+        self
+    }
+
+    pub(crate) fn set_skills(&mut self, skills: &[SkillMetadata]) {
+        self.commands
+            .retain(|item| !matches!(item, CommandItem::Skill { .. }));
+        // Append skills so exact builtin collisions keep the builtin first.
+        self.commands.extend(
+            skills
+                .iter()
+                .filter(|skill| skill.enabled && skill.scope == SkillScope::User)
+                .map(|skill| CommandItem::Skill {
+                    name: skill.name.clone(),
+                    description: crate::skills_helpers::skill_description(skill).to_string(),
+                    path: skill.path.to_string_lossy().into_owned(),
+                }),
+        );
+        self.state.clamp_selection(self.filtered_items().len());
+    }
+
     /// Update the filter string based on the current composer text. The text
     /// passed in is expected to start with a leading '/'. Everything after the
     /// *first* '/' on the *first* line becomes the active filter that is used
@@ -145,9 +174,9 @@ impl CommandPopup {
         )
     }
 
-    /// Compute exact/prefix matches over built-in commands and user prompts,
+    /// Compute exact/prefix matches over built-in commands and user skills,
     /// paired with optional highlight indices. Preserves the original
-    /// presentation order for built-ins and prompts.
+    /// presentation order for built-ins and skills.
     fn filtered(&self) -> Vec<(CommandItem, Option<Vec<usize>>)> {
         let filter = self.command_filter.trim();
         let mut out: Vec<(CommandItem, Option<Vec<usize>>)> = Vec::new();
@@ -210,7 +239,11 @@ impl CommandPopup {
             .into_iter()
             .enumerate()
             .map(|(index, (item, indices))| {
-                let name = format!("/{}", item.command());
+                let name = if matches!(item, CommandItem::Skill { .. }) {
+                    format!("/{} (skill)", item.command())
+                } else {
+                    format!("/{}", item.command())
+                };
                 let description = if matches!(item, CommandItem::Builtin(SlashCommand::Daybreak)) {
                     self.daybreak_command_description
                         .unwrap_or(item.description())
@@ -267,6 +300,7 @@ impl CommandItem {
         match self {
             Self::Builtin(cmd) => cmd.command(),
             Self::ServiceTier(command) => &command.name,
+            Self::Skill { name, .. } => name,
         }
     }
 
@@ -274,6 +308,7 @@ impl CommandItem {
         match self {
             Self::Builtin(cmd) => cmd.description(),
             Self::ServiceTier(command) => &command.description,
+            Self::Skill { description, .. } => description,
         }
     }
 }
@@ -296,7 +331,48 @@ impl WidgetRef for CommandPopup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::PathBufExt;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn slash_skill_prefix_and_collision_rows() {
+        let skill = |name: &str| codex_app_server_protocol::SkillMetadata {
+            name: name.into(),
+            description: "Test skill description".into(),
+            short_description: None,
+            interface: None,
+            dependencies: None,
+            path: crate::test_support::test_path_buf(&format!("/tmp/{name}/SKILL.md")).abs(),
+            scope: codex_app_server_protocol::SkillScope::User,
+            enabled: true,
+            plugin_id: None,
+        };
+        let mut disabled = skill("forbidden");
+        disabled.enabled = false;
+        let mut system = skill("format");
+        system.scope = codex_app_server_protocol::SkillScope::System;
+        let mut popup = CommandPopup::new(CommandPopupFlags::default(), Vec::new()).with_skills(&[
+            skill("foo"),
+            skill("model"),
+            disabled,
+            system,
+        ]);
+        popup.on_composer_text_change("/fo".into());
+        let rows = popup.rows_from_matches(popup.filtered());
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "/fork");
+        assert_eq!(rows[1].name, "/foo (skill)");
+        assert_eq!(
+            rows[1].description.as_deref(),
+            Some("Test skill description")
+        );
+        popup.on_composer_text_change("/model".into());
+        let rows = popup.rows_from_matches(popup.filtered());
+        assert_eq!(
+            rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+            vec!["/model", "/model (skill)"]
+        );
+    }
 
     #[test]
     fn filter_includes_init_when_typing_prefix() {
@@ -310,7 +386,7 @@ mod tests {
         let matches = popup.filtered_items();
         let has_init = matches.iter().any(|item| match item {
             CommandItem::Builtin(cmd) => cmd.command() == "init",
-            CommandItem::ServiceTier(_) => false,
+            CommandItem::ServiceTier(_) | CommandItem::Skill { .. } => false,
         });
         assert!(
             has_init,
@@ -331,6 +407,7 @@ mod tests {
             Some(CommandItem::ServiceTier(command)) => {
                 panic!("expected init command, got service tier {command:?}")
             }
+            Some(CommandItem::Skill { .. }) => panic!("unexpected skill"),
             None => panic!("expected a selected command for exact match"),
         }
     }
@@ -345,6 +422,7 @@ mod tests {
             Some(CommandItem::ServiceTier(command)) => {
                 panic!("expected model command, got service tier {command:?}")
             }
+            Some(CommandItem::Skill { .. }) => panic!("unexpected skill"),
             None => panic!("expected at least one match for '/mo'"),
         }
     }
@@ -438,6 +516,7 @@ mod tests {
             .map(|item| match item {
                 CommandItem::Builtin(cmd) => cmd.command().to_string(),
                 CommandItem::ServiceTier(command) => command.name,
+                CommandItem::Skill { name, .. } => name,
             })
             .collect();
         assert_eq!(
@@ -526,6 +605,7 @@ mod tests {
             .map(|item| match item {
                 CommandItem::Builtin(cmd) => cmd.command().to_string(),
                 CommandItem::ServiceTier(command) => command.name,
+                CommandItem::Skill { name, .. } => name,
             })
             .collect();
         assert!(
@@ -601,6 +681,7 @@ mod tests {
             .map(|item| match item {
                 CommandItem::Builtin(cmd) => cmd.command().to_string(),
                 CommandItem::ServiceTier(command) => command.name,
+                CommandItem::Skill { name, .. } => name,
             })
             .collect();
         assert!(
@@ -647,6 +728,7 @@ mod tests {
             .map(|item| match item {
                 CommandItem::Builtin(cmd) => cmd.command().to_string(),
                 CommandItem::ServiceTier(command) => command.name,
+                CommandItem::Skill { name, .. } => name,
             })
             .collect();
 

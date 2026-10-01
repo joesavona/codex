@@ -62,6 +62,8 @@
 //! Whitespace and atomic-element edges delimit occurrences, while nested sigils do not. This
 //! preserves dismissal across offset-only edits without suppressing a later identical token.
 //!
+//! User-installed skills also appear in slash completion. Accepting one inserts the same
+//! path-bound `$` mention used by skill completion; Enter then submits the draft.
 //! Slash-command dismissal is tracked separately. Pressing `Esc` while the command popup is active
 //! records the first-line `/name` token and keeps the popup closed while that token is unchanged.
 //! Editing the command token clears the dismissal and allows the popup to reopen.
@@ -686,6 +688,7 @@ impl ChatComposer {
             self.draft.is_bash_mode,
             self.builtin_command_flags(),
             &self.service_tier_commands,
+            self.skills.as_deref().unwrap_or_default(),
         )
     }
 
@@ -881,6 +884,9 @@ impl ChatComposer {
 
     pub fn set_skill_mentions(&mut self, skills: Option<Vec<SkillMetadata>>) {
         self.skills = skills;
+        if let ActivePopup::Command(popup) = &mut self.popups.active {
+            popup.set_skills(self.skills.as_deref().unwrap_or_default());
+        }
         self.refresh_mentions_v2_popup_candidates();
         self.sync_popups();
     }
@@ -6853,6 +6859,106 @@ mod tests {
         }
     }
 
+    #[test]
+    fn slash_skill_acceptance_matches_dollar_mention() {
+        let composer_for = |text: &str| {
+            let (mut composer, _rx) = new_test_composer();
+            composer.draft.disable_paste_burst = true;
+            composer.set_skill_mentions(Some(vec![test_skill_metadata("foo")]));
+            composer.set_text_content(text.to_string(), Vec::new(), Vec::new());
+            composer.draft.textarea.set_cursor(3);
+            composer.sync_popups();
+            composer
+        };
+        let mut dollar_composer = composer_for("$fo do the work");
+        dollar_composer.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let expected_draft = dollar_composer.draft.textarea.text().to_string();
+        let expected = dollar_composer
+            .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .0;
+        assert!(matches!(expected, InputResult::Submitted { .. }));
+        let expected_bindings = dollar_composer.take_recent_submission_mention_bindings();
+        assert_eq!(expected_bindings, vec![test_skill_binding("foo")]);
+
+        for acceptance in [KeyCode::Enter, KeyCode::Tab, KeyCode::Char('/')] {
+            let mut composer = composer_for("/fo do the work");
+            // /fork also matches /fo; explicitly select the skill below it.
+            composer.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            let (mut result, _) =
+                composer.handle_key_event(KeyEvent::new(acceptance, KeyModifiers::NONE));
+            if acceptance != KeyCode::Enter {
+                assert_eq!(result, InputResult::None);
+                assert_eq!(composer.draft.textarea.text(), expected_draft);
+                result = composer
+                    .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                    .0;
+            }
+            assert_eq!(result, expected);
+            assert_eq!(
+                composer.take_recent_submission_mention_bindings(),
+                expected_bindings
+            );
+        }
+    }
+
+    #[test]
+    fn slash_skill_collision_selects_builtin_then_skill() {
+        let (tx, _rx) = unbounded_channel();
+        let mut composer = ChatComposer::new(
+            /*has_input_focus*/ true,
+            AppEventSender::new(tx),
+            /*enhanced_keys_supported*/ false,
+            String::new(),
+            /*disable_paste_burst*/ true,
+        );
+        composer.set_skill_mentions(Some(vec![test_skill_metadata("model")]));
+        composer.set_text_content("/model".to_string(), Vec::new(), Vec::new());
+        composer.sync_popups();
+        let ActivePopup::Command(popup) = &mut composer.popups.active else {
+            panic!("missing slash popup");
+        };
+        assert_eq!(
+            popup.selected_item(),
+            Some(CommandItem::Builtin(SlashCommand::Model))
+        );
+        popup.move_down();
+        assert!(
+            matches!(popup.selected_item(), Some(CommandItem::Skill { name, .. }) if name == "model")
+        );
+        let (result, _) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(result, InputResult::Submitted { text, .. } if text == "$model"));
+        assert_eq!(
+            composer.draft.recent_submission_mention_bindings,
+            vec![test_skill_binding("model")]
+        );
+    }
+
+    #[test]
+    fn slash_skill_queues_as_plain_input_with_binding() {
+        let (tx, _rx) = unbounded_channel();
+        let mut composer = ChatComposer::new(
+            /*has_input_focus*/ true,
+            AppEventSender::new(tx),
+            /*enhanced_keys_supported*/ false,
+            String::new(),
+            /*disable_paste_burst*/ true,
+        );
+        composer.queue_submissions = true;
+        composer.set_skill_mentions(Some(vec![test_skill_metadata("foo")]));
+        composer.set_text_content("/foo".to_string(), Vec::new(), Vec::new());
+        composer.sync_popups();
+        let (result, _) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(result, InputResult::Queued { text, action: QueuedInputAction::Plain, .. } if text == "$foo")
+        );
+        assert_eq!(
+            composer.take_recent_submission_mention_bindings(),
+            vec![test_skill_binding("foo")]
+        );
+    }
+
     fn test_skill_binding(name: &str) -> MentionBinding {
         MentionBinding {
             sigil: '$',
@@ -9353,6 +9459,7 @@ mod tests {
                 Some(CommandItem::ServiceTier(command)) => {
                     panic!("expected model command, got service tier {command:?}")
                 }
+                Some(CommandItem::Skill { .. }) => panic!("unexpected skill"),
                 None => panic!("no selected command for '/mo'"),
             },
             _ => panic!("slash popup not active after typing '/mo'"),
@@ -9435,6 +9542,7 @@ mod tests {
                 Some(CommandItem::ServiceTier(command)) => {
                     panic!("expected resume command, got service tier {command:?}")
                 }
+                Some(CommandItem::Skill { .. }) => panic!("unexpected skill"),
                 None => panic!("no selected command for '/res'"),
             },
             _ => panic!("slash popup not active after typing '/res'"),
@@ -9489,6 +9597,7 @@ mod tests {
                 Some(CommandItem::ServiceTier(command)) => {
                     panic!("expected pets command, got service tier {command:?}")
                 }
+                Some(CommandItem::Skill { .. }) => panic!("unexpected skill"),
                 None => panic!("no selected command for '/pet'"),
             },
             _ => panic!("slash popup not active after typing '/pet'"),
@@ -9543,6 +9652,7 @@ mod tests {
                 Some(CommandItem::ServiceTier(command)) => {
                     panic!("expected btw command, got service tier {command:?}")
                 }
+                Some(CommandItem::Skill { .. }) => panic!("unexpected skill"),
                 None => panic!("no selected command for '/bt'"),
             },
             _ => panic!("slash popup not active after typing '/bt'"),
@@ -9597,6 +9707,7 @@ mod tests {
                 Some(CommandItem::ServiceTier(command)) => {
                     panic!("expected side command, got service tier {command:?}")
                 }
+                Some(CommandItem::Skill { .. }) => panic!("unexpected skill"),
                 None => panic!("no selected command for '/si'"),
             },
             _ => panic!("slash popup not active after typing '/si'"),

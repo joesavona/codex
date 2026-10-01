@@ -2,6 +2,8 @@
 
 use std::ops::Range;
 
+use codex_app_server_protocol::SkillMetadata;
+use codex_app_server_protocol::SkillScope;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
@@ -48,6 +50,7 @@ pub(super) struct SlashInput<'a> {
     is_bash_mode: bool,
     command_flags: BuiltinCommandFlags,
     service_tier_commands: &'a [ServiceTierCommand],
+    skills: &'a [SkillMetadata],
 }
 
 impl<'a> SlashInput<'a> {
@@ -56,12 +59,14 @@ impl<'a> SlashInput<'a> {
         is_bash_mode: bool,
         command_flags: BuiltinCommandFlags,
         service_tier_commands: &'a [ServiceTierCommand],
+        skills: &'a [SkillMetadata],
     ) -> Self {
         Self {
             enabled,
             is_bash_mode,
             command_flags,
             service_tier_commands,
+            skills,
         }
     }
 
@@ -166,6 +171,11 @@ impl<'a> SlashInput<'a> {
         }
 
         has_slash_command_prefix(name, self.command_flags, self.service_tier_commands)
+            || self.skills.iter().any(|skill| {
+                skill.enabled
+                    && skill.scope == SkillScope::User
+                    && skill.name.to_lowercase().starts_with(&name.to_lowercase())
+            })
     }
 
     pub(super) fn command_popup(&self, filter_text: &str) -> CommandPopup {
@@ -185,6 +195,7 @@ impl<'a> SlashInput<'a> {
             },
             self.service_tier_commands.to_vec(),
         );
+        command_popup = command_popup.with_skills(self.skills);
         command_popup.on_composer_text_change(filter_text.to_string());
         command_popup
     }
@@ -289,6 +300,9 @@ impl ChatComposer {
                     .unwrap_or_else(|| first_line.clone());
                 popup.on_composer_text_change(filter_text);
                 if let Some(selected_cmd) = popup.selected_item() {
+                    if self.complete_selected_slash_skill(&selected_cmd) {
+                        return (InputResult::None, true);
+                    }
                     if selected_command_dispatches_immediately_on_tab(&selected_cmd)
                         && let CommandItem::Builtin(cmd) = &selected_cmd
                     {
@@ -339,6 +353,9 @@ impl ChatComposer {
                     .unwrap_or_else(|| first_line.clone());
                 popup.on_composer_text_change(filter_text);
                 if let Some(selected_cmd) = popup.selected_item() {
+                    if self.complete_selected_slash_skill(&selected_cmd) {
+                        return (InputResult::None, true);
+                    }
                     if self
                         .complete_selected_slash_command_preserving_existing_draft_tail_as_inline_args(
                             &selected_cmd,
@@ -369,6 +386,13 @@ impl ChatComposer {
                 ..
             } => {
                 if let Some(sel) = popup.selected_item() {
+                    if matches!(sel, CommandItem::Skill { .. }) {
+                        if self.blocks_direct_input {
+                            return (InputResult::ParentOwnedInputBlocked, true);
+                        }
+                        self.complete_selected_slash_skill(&sel);
+                        return self.handle_key_event_without_popup(key_event);
+                    }
                     if self.blocks_direct_input {
                         let command_is_allowed = match &sel {
                             CommandItem::Builtin(cmd) => {
@@ -376,7 +400,7 @@ impl ChatComposer {
                                     |(_, args, _)| parent_owned_command_is_allowed(*cmd, args),
                                 )
                             }
-                            CommandItem::ServiceTier(_) => false,
+                            CommandItem::ServiceTier(_) | CommandItem::Skill { .. } => false,
                         };
                         if !command_is_allowed {
                             return (InputResult::ParentOwnedInputBlocked, true);
@@ -400,6 +424,7 @@ impl ChatComposer {
                     return (
                         match sel {
                             CommandItem::Builtin(cmd) => InputResult::Command(cmd),
+                            CommandItem::Skill { .. } => unreachable!("skill accepted above"),
                             CommandItem::ServiceTier(command) => {
                                 InputResult::ServiceTierCommand(command)
                             }
@@ -412,6 +437,18 @@ impl ChatComposer {
             }
             input => self.handle_input_basic(input),
         }
+    }
+
+    fn complete_selected_slash_skill(&mut self, selected: &CommandItem) -> bool {
+        let CommandItem::Skill { name, path, .. } = selected else {
+            return false;
+        };
+        let text = self.draft.textarea.text();
+        let token_end = text.find(char::is_whitespace).unwrap_or(text.len());
+        // Reuse mention insertion to preserve the skill path and draft arguments.
+        self.insert_selected_mention(0..token_end, &format!("${name}"), Some(path));
+        self.popups.active = ActivePopup::None;
+        true
     }
 
     fn complete_selected_slash_command_preserving_existing_draft_tail_as_inline_args(
