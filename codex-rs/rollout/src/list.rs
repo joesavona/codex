@@ -787,7 +787,7 @@ async fn build_thread_item(
 ) -> Option<ThreadItem> {
     // Read head and detect preview-bearing events; goal previews can appear before
     // the first normal user message.
-    let summary = read_head_summary(&path, HEAD_RECORD_LIMIT)
+    let mut summary = read_head_summary(&path, HEAD_RECORD_LIMIT)
         .await
         .unwrap_or_default();
     if !allowed_sources.is_empty()
@@ -802,6 +802,20 @@ async fn build_thread_item(
         && !matcher.matches(summary.model_provider.as_deref())
     {
         return None;
+    }
+    if cwd_filters.is_some()
+        && let Some(thread_id) = summary.thread_id
+    {
+        match read_latest_owned_cwd(&path, thread_id).await {
+            Ok(Some(cwd)) => summary.cwd = Some(cwd),
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(
+                    "failed to read latest owned cwd from rollout {}: {err}",
+                    path.display()
+                );
+            }
+        }
     }
     if let Some(cwd_filters) = cwd_filters
         && !summary.cwd.as_ref().is_some_and(|cwd| {
@@ -866,6 +880,27 @@ async fn build_thread_item(
         });
     }
     None
+}
+
+async fn read_latest_owned_cwd(path: &Path, thread_id: ThreadId) -> io::Result<Option<PathBuf>> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let reader = crate::open_rollout_seekable_reader(&path)?;
+        let mut scanner = crate::ReverseJsonlScanner::new(reader)?;
+        while let Some(outcome) = scanner.scan_next_rollout_line()? {
+            let crate::ScanOutcome::Parsed(line) = outcome else {
+                continue;
+            };
+            if let RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) = line.item
+                && event.thread_id == Some(thread_id)
+            {
+                return Ok(Some(event.thread_settings.cwd.into_path_buf()));
+            }
+        }
+        Ok(None)
+    })
+    .await
+    .map_err(io::Error::other)?
 }
 
 /// Read a single rollout file into the same summary item shape used by thread listing.

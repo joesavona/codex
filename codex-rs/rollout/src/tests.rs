@@ -1975,3 +1975,213 @@ async fn test_model_provider_filter_selects_only_matching_sessions() -> Result<(
 
     Ok(())
 }
+
+fn write_cwd_settings_session_file(
+    root: &Path,
+    ts_str: &str,
+    uuid: Uuid,
+    startup_cwd: &Path,
+    settings: &[(Option<ThreadId>, &Path)],
+    trailing_records: usize,
+) -> std::io::Result<std::path::PathBuf> {
+    let format: &[FormatItem] =
+        format_description!("[year]-[month]-[day]T[hour]-[minute]-[second]");
+    let dt = PrimitiveDateTime::parse(ts_str, format)
+        .unwrap()
+        .assume_utc();
+    let dir = root
+        .join("sessions")
+        .join(format!("{:04}", dt.year()))
+        .join(format!("{:02}", u8::from(dt.month())))
+        .join(format!("{:02}", dt.day()));
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("rollout-{ts_str}-{uuid}.jsonl"));
+    let mut file = File::create(&path)?;
+    let meta = serde_json::json!({
+        "timestamp": ts_str,
+        "type": "session_meta",
+        "payload": {
+            "session_id": uuid,
+            "id": uuid,
+            "timestamp": ts_str,
+            "cwd": startup_cwd,
+            "originator": "test_originator",
+            "cli_version": "test_version",
+            "source": "cli",
+            "model_provider": TEST_PROVIDER,
+            "base_instructions": null,
+        },
+    });
+    writeln!(file, "{meta}")?;
+    let user_event = serde_json::json!({
+        "timestamp": ts_str,
+        "type": "event_msg",
+        "payload": {
+            "type": "user_message",
+            "message": "Hello from user",
+            "kind": "plain",
+        },
+    });
+    writeln!(file, "{user_event}")?;
+    for (thread_id, cwd) in settings {
+        let event = serde_json::json!({
+            "timestamp": ts_str,
+            "type": "event_msg",
+            "payload": {
+                "type": "thread_settings_applied",
+                "thread_id": thread_id,
+                "thread_settings": {
+                    "model": "test-model",
+                    "model_provider_id": TEST_PROVIDER,
+                    "approval_policy": "never",
+                    "approvals_reviewer": "user",
+                    "permission_profile": codex_protocol::models::PermissionProfile::read_only(),
+                    "cwd": cwd,
+                    "collaboration_mode": {
+                        "mode": "default",
+                        "settings": {
+                            "model": "test-model",
+                            "reasoning_effort": null,
+                            "developer_instructions": null,
+                        },
+                    },
+                    "disabled_plugin_ids": [],
+                },
+            },
+        });
+        writeln!(file, "{event}")?;
+    }
+    for index in 0..trailing_records {
+        let event = serde_json::json!({
+            "timestamp": ts_str,
+            "type": "event_msg",
+            "payload": {
+                "type": "warning",
+                "message": format!("trailing record {index}"),
+            },
+        });
+        writeln!(file, "{event}")?;
+    }
+    let times = FileTimes::new().set_modified(dt.into());
+    file.set_times(times)?;
+    Ok(path)
+}
+
+async fn listed_thread_cwds(home: &Path, cwd: &Path) -> Vec<std::path::PathBuf> {
+    let cwd_filters = [cwd.to_path_buf()];
+    get_threads(
+        home,
+        /*page_size*/ 10,
+        /*cursor*/ None,
+        ThreadSortKey::CreatedAt,
+        INTERACTIVE_SESSION_SOURCES.as_slice(),
+        /*model_providers*/ None,
+        Some(cwd_filters.as_slice()),
+        TEST_PROVIDER,
+    )
+    .await
+    .expect("thread listing")
+    .items
+    .into_iter()
+    .filter_map(|item| item.cwd)
+    .collect()
+}
+
+#[tokio::test]
+async fn cwd_filter_uses_resume_checkpoint_at_eof_before_admitting_thread() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path();
+    let cwd_a = home.join("repo-a");
+    let cwd_b = home.join("repo-b");
+    let uuid = Uuid::from_u128(501);
+    write_cwd_settings_session_file(
+        home,
+        "2025-01-03T12-00-00",
+        uuid,
+        &cwd_a,
+        &[(Some(thread_id_from_uuid(uuid)), cwd_b.as_path())],
+        /*trailing_records*/ 0,
+    )
+    .unwrap();
+
+    assert!(listed_thread_cwds(home, &cwd_a).await.is_empty());
+    assert_eq!(listed_thread_cwds(home, &cwd_b).await, vec![cwd_b]);
+}
+
+#[tokio::test]
+async fn cwd_filter_skips_newer_unowned_settings_and_unbounded_suffix() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path();
+    let cwd_a = home.join("repo-a");
+    let cwd_b = home.join("repo-b");
+    let uuid = Uuid::from_u128(504);
+    let thread_id = thread_id_from_uuid(uuid);
+    write_cwd_settings_session_file(
+        home,
+        "2025-01-03T12-00-00",
+        uuid,
+        &cwd_a,
+        &[
+            (Some(thread_id), cwd_b.as_path()),
+            (Some(ThreadId::new()), cwd_a.as_path()),
+            (None, cwd_a.as_path()),
+        ],
+        /*trailing_records*/ 512,
+    )
+    .unwrap();
+
+    assert!(listed_thread_cwds(home, &cwd_a).await.is_empty());
+    assert_eq!(listed_thread_cwds(home, &cwd_b).await, vec![cwd_b]);
+}
+
+#[tokio::test]
+async fn cwd_filter_falls_back_to_startup_cwd_without_owned_settings() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path();
+    let cwd_a = home.join("repo-a");
+    let cwd_b = home.join("repo-b");
+    write_cwd_settings_session_file(
+        home,
+        "2025-01-03T12-00-00",
+        Uuid::from_u128(502),
+        &cwd_a,
+        &[
+            (Some(ThreadId::new()), cwd_b.as_path()),
+            (None, cwd_b.as_path()),
+        ],
+        /*trailing_records*/ 4096,
+    )
+    .unwrap();
+
+    assert_eq!(listed_thread_cwds(home, &cwd_a).await, vec![cwd_a]);
+    assert!(listed_thread_cwds(home, &cwd_b).await.is_empty());
+}
+
+#[tokio::test]
+async fn cwd_filter_reads_latest_owned_settings_from_compressed_rollout() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path();
+    let cwd_a = home.join("repo-a");
+    let cwd_b = home.join("repo-b");
+    let uuid = Uuid::from_u128(503);
+    let path = write_cwd_settings_session_file(
+        home,
+        "2025-01-03T12-00-00",
+        uuid,
+        &cwd_a,
+        &[(Some(thread_id_from_uuid(uuid)), cwd_b.as_path())],
+        /*trailing_records*/ 32,
+    )
+    .unwrap();
+    let compressed_path = path.with_extension("jsonl.zst");
+    let content = fs::read(&path).unwrap();
+    fs::write(
+        &compressed_path,
+        zstd::stream::encode_all(content.as_slice(), /*level*/ 3).unwrap(),
+    )
+    .unwrap();
+    fs::remove_file(path).unwrap();
+
+    assert!(listed_thread_cwds(home, &cwd_a).await.is_empty());
+    assert_eq!(listed_thread_cwds(home, &cwd_b).await, vec![cwd_b]);
+}
